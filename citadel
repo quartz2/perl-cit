@@ -1,0 +1,766 @@
+#!/usr/bin/perl
+
+#use strict;
+use MIME::Base64;
+use Socket;
+use Date::Manip;
+use File::Temp;
+
+$DEBUG = 0 ;
+$DEBUG_SQL  = 0;
+
+$ENV{"TZ"}="US/Eastern";
+
+$mytmpfile=mktemp("tmp/editor.XXXXXXX");
+
+#======================================================================
+# Connect to the MSQL server
+#======================================================================
+use DBI;
+$source = "dbi:mysql:bbs:127.0.0.1";
+$dbh = DBI->connect($source) || &interr("error, $filename:$line:$caller, dbi connect failed");
+
+#======================================================================
+# 'Require' all of the various subroutines
+#======================================================================
+
+print "Version: " 
+    . localtime( (stat(__FILE__))[9]) 
+    . " " 
+    . __FILE__ 
+    . "\n"
+    if ($DEBUG);
+
+require 'perl/terminal.pl';
+require 'perl/routines.pl';
+require 'perl/user.pl';
+require 'perl/message.pl';
+require 'perl/rooms.pl';
+require 'perl/bbswho.pl';
+require 'perl/useredit.pl';
+
+# pull all sorts of config info from the database.
+&readconfig;
+
+#read the configuration before setting up the commands
+#since some commands will be enabled/disabled based on
+#the FEATURES in the config
+require 'perl/command.pl';
+
+
+%AXLEVELS = ($CONFIG{'AXLEVEL_DEL'}, 'Marked for Deletion',
+	     $CONFIG{'AXLEVEL_NEW'}, 'New User',
+	     $CONFIG{'AXLEVEL_TWIT'}, 'Posting Disabled',
+	     $CONFIG{'AXLEVEL_NORM'}, 'Normal User',
+	     $CONFIG{'AXLEVEL_PREF'}, 'Preferred User',
+	     $CONFIG{'AXLEVEL_AIDE'}, 'Aide');
+
+
+#======================================================================
+# Set terminal parameters
+#======================================================================
+use POSIX qw(:termios_h);
+my ($term, $oterm, $echo, $noecho, $fd_stdin, $got);
+
+die "No controlling tty found. Please reconnect.\n(Did you specify a command argument to ssh?)\n" unless defined ($ENV{'SSH_TTY'});
+
+&set_terminal;
+
+if ($DEBUG_SQL) {
+    open (SQLLOG, ">>/tmp/sqllog");
+    select (SQLLOG); $|=1;
+}
+
+select (STDOUT); $| = 1; # set unbuffered (piped) output
+
+#======================================================================
+# Print the login banner, get the user's name, and do the right thing
+# if the status indicates new user
+#======================================================================
+
+&formout ($CONFIG{'FILE_HELLO'});
+
+ ENTER: ($status, $handle) = &enter_name;
+
+if ($status < 0) {    
+
+    # status < 0 means the entered handle did not exist
+    # we might have a new user (or it was a typo, do_new_user will find out)
+
+    ($handle) = &do_new_user ($handle);
+
+#   print STDERR "citadel/after do_new_user return: $handle\n" if ($DEBUG);
+
+    if ($handle < 0) { # negative reply assumes it was just a typo, start over
+	goto ENTER;
+    }
+    
+    # else.. we should fall through to the bbs
+    
+} else {
+    
+    # positive handle means we had an existing user
+    
+    if (&enter_password ($handle)) {
+	# positive reply here==bad password
+	#$badpwcount++;  #implement bad pw count
+	goto ENTER;   #sigh;
+    }
+    
+    # else, we should fall through to the bbs
+}
+
+# At this point, user is logged in (and possibly just created)
+# Fetch the user's eternal based on their handle if we don't already have it
+
+$eternal = &sql_return_eternal;
+
+#======================================================================
+# Set up the bbswho for this user 
+#======================================================================
+
+&init_btmp;
+
+#======================================================================
+# Get the user's prefs as of last login, 
+# initialize the user's global properties.
+#======================================================================
+undef %USER;
+
+%USER = &get_rw_user_prefs($eternal, %USER);
+
+#USER{HOST} = lastlogin host
+#$hostname = current login host
+
+#here's a good place to see what the date of the last call was,
+#and if it's not today, reset timetoday
+# if it IS today, check to see if timetoday > timelimit
+# and bounce the user if necessary
+
+my $midnight = ParseDate("midnight");
+$midnight = UnixDate($midnight,"%s");
+			
+if ($USER{'lastcall'} < $midnight) {
+    $USER{'timetoday'}=0;
+} else {
+;    print "Your last call was earlier today.\n";
+}
+
+#======================================================================
+# Print login banner 
+#======================================================================
+&print_login_banner;
+
+#======================================================================
+# Update "lastlogin" fields.
+#======================================================================
+&sql_lastlogin_info;
+
+#======================================================================
+#Check registration status and register the user if necessary
+#======================================================================
+
+if (
+    ($CONFIG{'FEATURE_REGISCALL'}>0) && 
+    ($USER{'timescalled'} >= $CONFIG{'FEATURE_REGISCALL'}) &&
+    ($USER{'regis'} < 1)
+    ) {
+    &set_registration;
+}
+
+# global stuff for eventual logging
+
+$timein = time;
+$session_posts=0;
+$session_read=0;
+$linecount=0;
+
+# variables for main.
+my $lastseen; #returned by readmsgs, indicates where user stopped reading
+my $hir;      #returned by readmsgs, indicates highest msg in room
+my $lastcmd;  #used for smartspace functionality
+
+
+# get_all_cit_flags sets up several arrays of room flags pertaining to the user
+# Zapped_Room = Zapped Room arry
+# Lastseen_Room = lastseen value arry
+# Roomaide_Room = roomaide status arry,
+# Private_Room = private room permission arry
+# Skipping_Room = which rooms were skipped
+
+&get_rw_user_flags;
+&get_r_user_flags;
+
+undef %Skipping_Room; 
+
+# get_all_room_flags returns an several arrays pertaining to the rooms
+# Room_Flags  ${rm}.postax , enterax, private, anon, editor
+# Room_Numbers key name = number
+# Room_Names key number = name
+
+&get_all_room_flags;
+
+#======================================================================
+# New mail check
+#======================================================================
+
+my ($mtot, $mnew) = &msg_nums(2);
+if ($mnew>0) {
+    print "You have $mnew new ";
+    if ($mnew==1) {
+	print "message in Mail>.\n\n";
+    } else {
+	print "messages in Mail>.\n\n";
+    }
+}
+
+#======================================================================
+# Enter the Lobby>
+#======================================================================
+my $curr_rm = 1;
+&gotoroom($curr_rm);
+
+&enter_btmp ("$Room_Names{$curr_rm}");
+
+my $mode; my $pls;
+if ($USER{'timescalled'} == 1) {
+    $mode=1; $pls=-5;                 
+} else {
+    $mode=0; $pls=$Lastseen_Room{$curr_rm}; 
+}
+
+($lastseen, $hir) = &readmsgs($curr_rm, $pls, $mode, 1);
+
+$mcmd=14; # last thing we did was read new in Lobby.
+
+#======================================================================
+# We're at a room prompt at this point...
+# Process the main command loop
+#======================================================================
+
+COMMANDPROCESS: while (1) { 
+
+# do some things each time through the loop, e.g. to handle someone's
+# axlevel changing while they are logged in.  also, do some Aide
+# housekeeping, like notify if new users are waiting for validation.
+
+    %USER       = &get_r_user_prefs($eternal, %USER);
+    &get_r_user_flags;
+    &get_all_room_flags;
+
+    if ($USER{'axlevel'} >= $CONFIG{'AXLEVEL_AIDE'} && $curr_rm==1) {
+	my $nv=&check_needvalid($USER{'axlevel'});
+	print "\n$nv new users need to be validated.\n" if ($nv>0);
+    }
+
+#    print "private = " . $Room_Flags{"${curr_rm}.private"} . "\n";
+#    print "enterax = " . $Room_Flags{"${curr_rm}.enterax"} . "\n";
+
+    if ( $Room_Flags{"${curr_rm}.private"}>0 || $Room_Flags{"${curr_rm}.anon"}>0 || $Room_Flags{"${curr_rm}.enterax"}>$CONFIG{'AXLEVEL_NORM'} ) {
+#	print "Room is Hidden\n";
+	&enter_btmp ("Mail");
+    } else {
+	&enter_btmp ("$Room_Names{$curr_rm}");
+    }
+
+#    print "\n(SQL=$sql_count) $Room_Names{$curr_rm}";
+    print "\n$Room_Names{$curr_rm}";
+    ($Roomaide_Room{$curr_rm}>0) ? print "# " : print "> ";
+
+    #lastcmd will be used to implement "smartspace", see getcmd.
+    # we will only change the "lastcmd" when a reading or gotoing
+    # command is issued
+    $lastcmd = $mcmd if ( $mcmd == 14 ||
+			  $mcmd == 6  ||
+			  $mcmd == 12 ||
+			  $mcmd == 15 ||
+			  $mcmd == 16 ||
+			  $mcmd == 18 ||
+			  $mcmd == 27 ||
+			  $mcmd == 7  ||
+			  $mcmd == 13 ||
+			  $mcmd == 1  ||
+			  $mcmd == 19 ||
+			  $mcmd == 21);
+    $mcmd    = &getcmd($curr_rm,$lastcmd);
+
+    $linecount=0; # start over at the beginning of each cmd.
+
+# ---------------------- Message Entry Commands ------------------------
+
+    # key = "E", Enter Message (with default editor vs. input sucker)
+    if ($mcmd==5) { 
+	($lastseen,$hir)=&enter_message($curr_rm, 0, 0);
+	next COMMANDPROCESS;
+    }
+    
+    # key = ".EE", Enter Message With Editor
+    if ($mcmd==60) {
+	($lastseen,$hir)=&enter_message($curr_rm, 0, 2);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".EU", Enter Message Unformatted
+    if ($mcmd==62) { 
+	($lastseen,$hir)=&enter_message($curr_rm, 0, 1);
+	next COMMANDPROCESS;
+    }
+
+    # Key = ".EW", Enter Message Without Editor
+    if ($mcmd==63) { 
+	($lastseen,$hir)=&enter_message($curr_rm, 0, 3);
+	next COMMANDPROCESS;
+    }
+
+# ----------------------- Message Reading Commands ----------------------
+
+    # in case this is their first visit...
+#    $lastseen = 0 unless ($Lastseen_Room{$curr_rm}>0);
+
+    # key = "F", Read All Forward
+    if ($mcmd==6) {
+	($lastseen,$hir)=&readmsgs($curr_rm, 0, 1, 1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "L", Read Last 5
+    if ($mcmd==12) {
+	($lastseen,$hir)=&readmsgs($curr_rm, -5, 1, 1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "N", Read New
+    if ($mcmd==14) {
+	($lastseen,$hir)=&readmsgs($curr_rm, $Lastseen_Room{$curr_rm}, 0, 1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "O", Read Old Reverse 
+    # (same as read new except direction)
+    if ($mcmd==15) { 
+	($lastseen,$hir)=&readmsgs($curr_rm, $Lastseen_Room{$curr_rm}, 0, -1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "P", Read Last 10
+    if ($mcmd==16) {
+	($lastseen,$hir)=&readmsgs($curr_rm, -10, 1, 1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "R", Read All Reverse
+    if ($mcmd==18) {
+	($lastseen,$hir)=&readmsgs($curr_rm, 0, 1, -1);
+	next COMMANDPROCESS;
+    }
+
+    # key = "#", Read Last "X"
+    if ($mcmd==27) {
+	print "Read how many: ";
+	my $h = &getline(5);
+	$h = (abs(int($h)))*-1;
+
+	($lastseen,$hir)=&readmsgs($curr_rm, $h, 1, 1);
+	next COMMANDPROCESS;
+    }
+
+# ------------------- Room Goto Commands ------------------------
+
+    # key = "A", Abandon Room
+    # Abandon marks lastseen=actual lastseen msg.
+    if ($mcmd==1) {
+	# maybe they haven't done any reading or entering, they just hit goto, so make sure they have a valid hir
+#	print "curr $curr_rm ls $lastseen\n";
+	if ($lastseen < $Lastseen_Room{$curr_rm}) {
+	    $lastseen = $Lastseen_Room{$curr_rm};
+	}
+#	print "curr $curr_rm ls $lastseen\n";
+	&update_lastseen($curr_rm, $lastseen);
+
+	push @roomhistory, "$curr_rm,$lastseen";
+	$Skipping_Room{$curr_rm}=1;
+
+	$curr_rm  = &gotonext;
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	$lastseen=$Lastseen_Room{$curr_rm}; $hir=$Lastseen_Room{$curr_rm};
+	next COMMANDPROCESS;
+    }
+
+    # key = "G", Goto Next
+    # Updates lastseen with highest in room
+    if ($mcmd==7) {
+#	print "goto, ls $lastseen hir $hir\n lsr $Lastseen_Room{$curr_rm}\n";
+	# maybe they haven't done any reading or entering, they just hit goto, so make sure they have a valid hir
+	# this would only be used if they didn't just read some messages,right?
+	# if they did read some messages, lastseen=higest they've read, hir=highest in room
+	# you want to set lastseen_room=$highest they've read.
+	if ($hir > $Lastseen_Room{$curr_rm}) {
+	    $lastseen=$hir;
+	} elsif ($Lastseen_Room{$curr_rm} == 0 && $hir==0) {
+	    my @end_hir = &msg_list($curr_rm);
+	    $lastseen = $end_hir[$#end_hir];
+	    $hir=$lastseen;
+	}
+	    
+#	print "goto, ls $lastseen hir $hir\n lsr $Lastseen_Room{$curr_rm}\n";
+	# the roomhistory will get the Lastseen they came in with
+
+	push @roomhistory, "$curr_rm,$Lastseen_Room{$curr_rm}";
+	&update_lastseen($curr_rm, $lastseen);
+#	print "after updls, ls $lastseen hir $hir\n lsr $Lastseen_Room{$curr_rm}\n";
+	# get a next room, go to it, and clear the counters
+	$curr_rm  = &gotonext;
+	($lastseen,$hir)=&gotoroom($curr_rm);
+#	print "after goto, ls $lastseen hir $hir\n lsr $Lastseen_Room{$curr_rm}\n";
+	next COMMANDPROCESS;
+    } 
+
+    # key = ".G" or "J", Dot Goto / Jump
+    # Updates lastseen with highest in room
+    if ($mcmd==10) {
+	# maybe they haven't done any reading or entering, they just hit goto, so make sure they have a valid hir
+	if ($hir < $Lastseen_Room{$curr_rm}) {
+	    my @end_hir = &msg_list($curr_rm);
+	    $hir = $end_hir[$#end_hir];
+	}
+	&update_lastseen($curr_rm, $hir);
+	push @roomhistory, "$curr_rm,$Lastseen_Room{$curr_rm}";
+
+	$curr_rm = &jump($curr_rm);
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	$lastseen=$Lastseen_Room{$curr_rm}; $hir=$Lastseen_Room{$curr_rm};
+
+	next COMMANDPROCESS;
+    }
+
+    # key = "M", Goto Mail Room
+    # Updates lastseen with highest in room
+    if ($mcmd==13) {
+	# maybe they haven't done any reading or entering, they just hit goto, so make sure they have a valid hir
+	if ($hir < $Lastseen_Room{$curr_rm}) {
+	    my @end_hir = &msg_list($curr_rm);
+	    $hir = $end_hir[$#end_hir];
+	}
+	&update_lastseen($curr_rm, $hir);
+	push @roomhistory, "$curr_rm,$Lastseen_Room{$curr_rm}";
+
+	$curr_rm  = 2; # new C_R -> mail
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	$lastseen=$Lastseen_Room{$curr_rm}; $hir=$Lastseen_Room{$curr_rm};
+	next COMMANDPROCESS;
+    }
+
+    # key = "S", Skip Room
+    # Updates lastseen with the value they came in with, but sets skipping too
+    if ($mcmd==19) { #skip out of room
+
+	# maybe they haven't done any reading or entering, they just hit goto, so make sure they have a valid hir
+	if ($hir <= $Lastseen_Room{$curr_rm}) {
+	    my @end_hir = &msg_list($curr_rm);
+	    $hir = $end_hir[$#end_hir];
+	}
+
+	# roomhistory gets the value they came in with (mostly for ungoto purposes)
+
+	push @roomhistory, "$curr_rm,$Lastseen_Room{$curr_rm}";
+	&update_lastseen($curr_rm, $Lastseen_Room{$curr_rm});
+
+	$Skipping_Room{$curr_rm}=1;
+
+	$curr_rm  = &gotonext;
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	$lastseen=$Lastseen_Room{$curr_rm}; $hir=$Lastseen_Room{$curr_rm};
+
+	next COMMANDPROCESS;
+    }
+
+    # key = "U", Ungoto
+    # Pop last room and last room's lastseen
+    if ($mcmd==21) {
+	# kinda like dotgoto but don't update_lastseen of curr_rm 
+
+	my ($ncurr_rm,$npls) = split (/,/, pop @roomhistory);
+
+	unless ($ncurr_rm) { #trying to ungoto with nothing on the stack
+	    print "Can't ungoto, nothing on the stack.\n";
+	    next COMMANDPROCESS;
+	}
+
+	$curr_rm=$ncurr_rm;
+	$Lastseen_Room{$curr_rm}=$npls;
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	next COMMANDPROCESS;
+    }
+
+    # key = "Z", Zap Room (then Goto Next)
+    if ($mcmd==26) {
+	&zap_room ($curr_rm, $eternal, $USER{'axlevel'});
+
+	&update_lastseen($curr_rm, $hir);
+	push @roomhistory, "$curr_rm,$lastseen";
+
+	$curr_rm  = &gotonext($eternal, $USER{'axlevel'}); 
+
+	($lastseen,$hir)=&gotoroom($curr_rm);
+	next COMMANDPROCESS;
+    }
+
+
+# ----------------- Other Room Commands -------------------
+
+    # key = "D", print description & roomaide status
+    if ($mcmd==4) { 
+	&print_room_desc($curr_rm);
+    }
+
+    # key = "K", list known rooms
+    if ($mcmd==11) {
+	&list_known_rooms;
+	next COMMANDPROCESS;
+    }
+
+    # key = ".Z", list zapped rooms
+    if ($mcmd==77) { 
+	&list_zapped_rooms($eternal);
+	next COMMANDPROCESS;
+    }
+
+
+
+#print roominfo
+#mark all in all rooms to be read
+
+# --------------------- Aide + Roomaide ------------------------------
+# (commands_process will not allow non-roomaides to do these,
+# but each routine should to check if roomaides are allowed anyway)
+
+    # key = ".AC", create room, then jump to it
+    if ($mcmd==30) {  
+	&update_lastseen($curr_rm, $hir);
+	push @roomhistory, "$curr_rm,$lastseen";
+	$ncurr_rm = &create_room($USER{'axlevel'}, $eternal);
+	if ($ncurr_rm>0) {
+	    $curr_rm=$ncurr_rm;
+	}
+	&get_all_room_flags;
+	&gotoroom($curr_rm,$eternal,$USER{'axlevel'}, $Roomaide_Room{$curr_rm});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AB", clear bbswho entry
+    if ($mcmd==80) {  
+	&clear_btmp_custom;
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AE", edit room, then "goto" it, to refresh
+    if ($mcmd==32) {
+	&edit_room($curr_rm);
+	&gotoroom($curr_rm,$eternal,$USER{'axlevel'},$Roomaide_Room{$curr_rm});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AK", kick out a user from a private room
+    if ($mcmd==33) { 
+	&kickout_user($curr_rm, $eternal, $USER{'axlevel'},
+		      $Roomaide_Room{$curr_rm}, $Room_Names{$curr_rm});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AI", invite a user to a private room
+    if ($mcmd==34) { 
+	&invite_user($curr_rm, $eternal, $USER{'axlevel'},
+		     $Roomaide_Room{$curr_rm}, $Room_Names{$curr_rm});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AU", edit user
+    if ($mcmd==37) {
+	&ask_edit_user;
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AX", ax (remove) room. return to lobby after removing.
+    if ($mcmd==35) {
+	&delete_room($USER{'axlevel'}, $eternal, $curr_rm);
+	$curr_rm=1;
+	&gotoroom($curr_rm);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AW", who knows room
+    if ($mcmd==39) {
+	&who_knows_room($curr_rm);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AV", validate new users
+    if ($mcmd==38) {
+	&validate_users($USER{'axlevel'});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".ALU", show call log
+    if ($mcmd==78) {
+	&show_log($USER{'axlevel'},78);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".ALA", show activity log
+    if ($mcmd==79) {
+	&show_log($USER{'axlevel'},79);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".AD", enter room description
+    if ($mcmd==31) {
+	&enter_room_description($curr_rm);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".A!", Kill a pid
+    if ($mcmd==40) {
+	&kill_pid;
+	next COMMANDPROCESS;
+    }
+
+    # key = ".A(", show env
+    if ($mcmd==44) {
+	foreach $x (sort keys %ENV) {
+	    print "$x = $ENV{$x}\n";
+	}
+	next COMMANDPROCESS;
+    }
+
+
+
+
+# ------------------- Configuration Commands -------------------------
+
+    # key = ".CC" configure user prefs (i.e. user config)
+    if ($mcmd==51) {
+	&edit_user($eternal);
+	next COMMANDPROCESS;
+    }
+
+    # key = ".CP", change password
+    if ($mcmd==53) {    
+	&set_passwd($handle, 1);
+	next COMMANDPROCESS;
+    }
+
+# enter/edit bio, 50
+
+# ------------------------- Misc Commands ----------------------------
+
+    #key = "C", interactive chat, key enabled in sysconfig
+    if ($mcmd==3) {
+	if ( ! -f "$CONFIG{'PROG_CHAT'}" ) {
+	    print "Chat program not available.\n";
+	} else {
+	    &unset_terminal;
+	    system "$CONFIG{'PROG_CHAT'}"; #this doesn't quite work. needs args.
+	    &set_terminal;
+	}
+	next COMMANDPROCESS;
+    }
+
+    # key = "H" or "?", print help.
+    if ($mcmd==8) {
+	foreach my $x (sort keys %commands) {
+	    next if (ord($x) < 32);
+	    my ($msg) = (unpack ($template, $commands{$x}))[1];
+	    print "$x.... $msg\n";
+	}
+	print "Press . (dot) to access extended commands. .? for help.\n";
+	next COMMANDPROCESS;
+    }
+
+    # key = "W", see who's online (bbswho)
+    if ($mcmd==23) {                 
+	&read_btmp;
+	next COMMANDPROCESS;
+    }
+
+    # key = "Y", print a fortune, enabled in sysconfig.
+    if ($mcmd==25) {                 
+	if ( ! -f "$CONFIG{'PROG_FORTUNE'}" ) {
+	    print "Fortune program not available.\n";
+	} else {
+	    system "$CONFIG{'PROG_FORTUNE'}";
+	}
+	next COMMANDPROCESS;
+    }
+
+    # key = "@", print date & time
+    if ($mcmd==28) {                 
+	my $t=time;
+	print localtime($t) . "\n";
+	next COMMANDPROCESS;
+    }
+
+    # key = "%", set custom wholist comment (bbswho)
+    if ($mcmd==41) {                 
+	&enter_btmp_custom;
+	next COMMANDPROCESS;
+    }
+
+    # key = "Control-W", see who's online (bbswho) (alternate)
+    if ($mcmd==42) {     
+	&read_btmp_alternate;
+	next COMMANDPROCESS;
+    }
+
+    # key = "Control-T", uptime
+    if ($mcmd==43) {     
+	system "uptime";
+	next COMMANDPROCESS;
+    }
+
+    # key = ".RU", read user 
+    if ($mcmd==75) {
+	&read_user(0, $eternal, $USER{'axlevel'});
+	next COMMANDPROCESS;
+    }
+
+    # key = ".RY", read yourself
+    if ($mcmd==76) {
+	&read_user($eternal, $eternal, $USER{'axlevel'});
+	next COMMANDPROCESS;
+    }
+
+
+    # key = ".RS", print system config
+    if ($mcmd==74) {
+	&showconfig;
+	next COMMANDPROCESS;
+    }
+
+    # key = ".RT", print stats
+    if ($mcmd==81) {
+	if ( ! -f "$CONFIG{'PROG_STATS'}" ) {
+	    print "Statistics program not available.\n";
+	} else {
+	    system "$CONFIG{'PROG_STATS'}";
+	}
+	next COMMANDPROCESS;
+    }
+
+    # key = ".CB", configure / enter user bio
+    if ($mcmd==50) {
+	&enter_user_bio;
+	next COMMANDPROCESS;
+    }
+
+
+    # key = "T" or "Control-D", logoff.
+    # mcmd used to determine if user should be prompted or not. 
+    if ($mcmd==20 || $mcmd==29) {
+	&update_lastseen($curr_rm, $hir);
+	&user_terminate($mcmd);
+	next COMMANDPROCESS;
+    }
+}
+
+exit; #should never reach here.
+
